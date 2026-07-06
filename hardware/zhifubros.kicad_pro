@@ -648,7 +648,7 @@
         "uuid": "1f224e98-a6d6-428c-909b-47877360d011"
       }
     ],
-    "used_designators": "MPU6051,U3,J1",
+    "used_designators": "",
     "variants": []
   },
   "sheets": [
