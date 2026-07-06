@@ -1,6 +1,8 @@
 # ZHIFUBAO
 you might have some questions regarding the name of the drone, lets not go there just that it translates to alipay in chinese
 
+ESP32-based motion controlled drone!!
+
 # WHY
 HEYHEYHEY SO WE ARE IN SHENZEN, 72 HOURS, IN THE CORE CITY OF COMPONENTS, SO WE DECIDED TO MAKE A GESTURE CONTROLLED DRONE!!!!
 
@@ -8,8 +10,11 @@ HEYHEYHEY SO WE ARE IN SHENZEN, 72 HOURS, IN THE CORE CITY OF COMPONENTS, SO WE 
 ZHIFUBAO is a gesture-controlled drone built for Fallout in Shenzhen.  
 Instead of using a normal controller, we use hand movement as input to control the drone.
 
-Tilt hand = drone moves.  
-Simple in concept.
+Tilt hand = drone moves. sounds easy enough fr
+
+## Zine
+<img width="1587" height="2245" alt="zhifubao" src="https://github.com/user-attachments/assets/e4a469e5-3b37-47a5-8a73-83b22b47937c" />
+
 
 ## HOW IT WORKS
 - A motion sensor / IMU reads hand movement
@@ -17,6 +22,14 @@ Simple in concept.
 - Gestures are mapped to drone controls like pitch, roll, yaw, and throttle
 - Commands are sent wirelessly to the drone
 - The drone (hopefully) listens
+
+## WIRING DIAGRAM
+<img width="1047" height="728" alt="image" src="https://github.com/user-attachments/assets/641a8a6b-2809-4dd7-a2a6-78537eadc2a6" />
+
+### actual wiring 
+<img width="192" height="139" alt="image" src="https://github.com/user-attachments/assets/d3d945f1-5ded-4806-8b48-b4455ea42eeb" />
+
+
 
 # BTS
 
