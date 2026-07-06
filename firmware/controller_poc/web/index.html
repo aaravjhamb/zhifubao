@@ -1,0 +1,365 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>XIAO IMU - Dual Controller</title>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #0b0e14;
+      color: #e6e6e6;
+      overflow: hidden;
+    }
+    #view { position: fixed; inset: 0; z-index: 0; display: block; }
+    .hud {
+      position: fixed;
+      top: 16px;
+      z-index: 10;
+      background: rgba(20, 24, 34, 0.85);
+      border: 1px solid #2a3242;
+      border-radius: 12px;
+      padding: 16px 18px;
+      width: 240px;
+      backdrop-filter: blur(6px);
+    }
+    #hud-left  { left: 16px; }
+    #hud-right { right: 16px; }
+    h1 { font-size: 15px; margin: 0 0 12px; letter-spacing: .04em; display: flex; align-items: center; gap: 8px; }
+    h1 .chip { width: 12px; height: 12px; border-radius: 3px; }
+    button {
+      width: 100%;
+      padding: 10px 14px;
+      font-size: 14px;
+      font-weight: 600;
+      color: #0b0e14;
+      background: #4ade80;
+      border: none;
+      border-radius: 8px;
+      cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: default; }
+    button.disconnect { background: #f87171; }
+    .status { margin-top: 10px; font-size: 13px; color: #9aa4b2; }
+    .status .dot {
+      display: inline-block; width: 8px; height: 8px;
+      border-radius: 50%; margin-right: 6px; background: #f87171;
+      vertical-align: middle;
+    }
+    .status.on .dot { background: #4ade80; }
+    .rows { margin-top: 12px; font-variant-numeric: tabular-nums; font-size: 13px; }
+    .rows div { display: flex; justify-content: space-between; padding: 2px 0; color: #c4ccd8; }
+    .rows span:last-child { color: #7dd3fc; }
+    .subrows { border-top: 1px solid #2a3242; margin-top: 8px; padding-top: 6px; }
+    #hint {
+      position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+      z-index: 10; font-size: 11px; color: #6b7482; text-align: center; line-height: 1.5;
+    }
+  </style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+
+  <!-- Left controller panel -->
+  <div class="hud" id="hud-left">
+    <h1><span class="chip" style="background:#38bdf8"></span>Left controller</h1>
+    <button id="connectL">Connect Left</button>
+    <div class="status" id="statusL"><span class="dot"></span><span id="statusTextL">Disconnected</span></div>
+    <div class="rows">
+      <div><span>Roll</span><span id="rollL">—</span></div>
+      <div><span>Pitch</span><span id="pitchL">—</span></div>
+      <div><span>Yaw</span><span id="yawL">—</span></div>
+    </div>
+    <div class="rows subrows">
+      <div><span>Light</span><span id="lightL">—</span></div>
+      <div><span>Rate</span><span id="rateL">—</span></div>
+    </div>
+  </div>
+
+  <!-- Right controller panel -->
+  <div class="hud" id="hud-right">
+    <h1><span class="chip" style="background:#fb923c"></span>Right controller</h1>
+    <button id="connectR">Connect Right</button>
+    <div class="status" id="statusR"><span class="dot"></span><span id="statusTextR">Disconnected</span></div>
+    <div class="rows">
+      <div><span>Roll</span><span id="rollR">—</span></div>
+      <div><span>Pitch</span><span id="pitchR">—</span></div>
+      <div><span>Yaw</span><span id="yawR">—</span></div>
+    </div>
+    <div class="rows subrows">
+      <div><span>Light</span><span id="lightR">—</span></div>
+      <div><span>Rate</span><span id="rateR">—</span></div>
+    </div>
+  </div>
+
+  <div id="hint">
+    Chrome/Edge over <b>localhost</b> or HTTPS. Each button lists only its own
+    board: <code>XIAO-IMU-L</code> for Left, <code>XIAO-IMU-R</code> for Right.
+  </div>
+
+  <!-- Self-contained: no external libraries, so nothing to download or stall on. -->
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    // ---- Must match the firmware (one UUID set per side) ----
+    const UUIDS = {
+      L: { service: '12345678-1234-5678-1234-56789abcde10',
+           characteristic: '12345678-1234-5678-1234-56789abcde11' },
+      R: { service: '12345678-1234-5678-1234-56789abcde20',
+           characteristic: '12345678-1234-5678-1234-56789abcde21' },
+    };
+
+    // ---------- Tiny quaternion helpers (q = {w,x,y,z}) ----------
+    function qNorm(q) {
+      const n = Math.hypot(q.w, q.x, q.y, q.z) || 1;
+      return { w: q.w / n, x: q.x / n, y: q.y / n, z: q.z / n };
+    }
+    // Rotate a 3-vector by q.
+    function qRot(q, v) {
+      const { w, x, y, z } = q;
+      const tx = 2 * (y * v[2] - z * v[1]);
+      const ty = 2 * (z * v[0] - x * v[2]);
+      const tz = 2 * (x * v[1] - y * v[0]);
+      return [
+        v[0] + w * tx + (y * tz - z * ty),
+        v[1] + w * ty + (z * tx - x * tz),
+        v[2] + w * tz + (x * ty - y * tx),
+      ];
+    }
+    // Normalized-lerp toward a target (cheap smoothing, shortest path).
+    function qNlerp(a, b, t) {
+      const dot = a.w * b.w + a.x * b.x + a.y * b.y + a.z * b.z;
+      const s = dot < 0 ? -1 : 1;
+      return qNorm({
+        w: a.w + (b.w * s - a.w) * t,
+        x: a.x + (b.x * s - a.x) * t,
+        y: a.y + (b.y * s - a.y) * t,
+        z: a.z + (b.z * s - a.z) * t,
+      });
+    }
+    // Euler (YXZ) in degrees, matching the previous HUD readout.
+    function eulerYXZ(q) {
+      const { w, x, y, z } = q;
+      const m11 = 1 - 2 * (y * y + z * z), m13 = 2 * (x * z + w * y);
+      const m21 = 2 * (x * y + w * z), m22 = 1 - 2 * (x * x + z * z), m23 = 2 * (y * z - w * x);
+      const m31 = 2 * (x * z - w * y), m33 = 1 - 2 * (x * x + y * y);
+      const cl = (v) => Math.max(-1, Math.min(1, v));
+      const pitch = Math.asin(cl(-m23));
+      let yaw, roll;
+      if (Math.abs(m23) < 0.9999999) { yaw = Math.atan2(m13, m33); roll = Math.atan2(m21, m22); }
+      else { yaw = Math.atan2(-m31, m11); roll = 0; }
+      const d = 180 / Math.PI;
+      return { roll: roll * d, pitch: pitch * d, yaw: yaw * d };
+    }
+
+    // ---------- Canvas 3D renderer (painter's algorithm) ----------
+    const canvas = $('view');
+    const ctx = canvas.getContext('2d');
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    let W = 0, H = 0, cx = 0, cy = 0;
+    function resize() {
+      W = innerWidth; H = innerHeight; cx = W / 2; cy = H / 2;
+      canvas.width = W * dpr; canvas.height = H * dpr;
+      canvas.style.width = W + 'px'; canvas.style.height = H + 'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    addEventListener('resize', resize);
+    resize();
+
+    const VIEW_PITCH = -0.30;    // tilt so we see the top faces a bit
+    const CAM_DIST   = 8;        // camera distance along +Z
+    function project(p) {
+      const cosP = Math.cos(VIEW_PITCH), sinP = Math.sin(VIEW_PITCH);
+      const y1 = p[1] * cosP - p[2] * sinP;
+      const z1 = p[1] * sinP + p[2] * cosP;
+      const depth = CAM_DIST - z1;             // larger = farther
+      const f = (Math.min(W, H) * 0.9) / depth;
+      return { x: cx + p[0] * f, y: cy - y1 * f, depth };
+    }
+
+    const HALF = 0.9;
+    const VERTS = [
+      [-HALF, -HALF, -HALF], [HALF, -HALF, -HALF], [HALF, HALF, -HALF], [-HALF, HALF, -HALF],
+      [-HALF, -HALF,  HALF], [HALF, -HALF,  HALF], [HALF, HALF,  HALF], [-HALF, HALF,  HALF],
+    ];
+    const FACES = [
+      { idx: [1, 5, 6, 2], color: '#ef4444' }, // +X
+      { idx: [0, 4, 7, 3], color: '#f97316' }, // -X
+      { idx: [3, 2, 6, 7], color: '#22c55e' }, // +Y
+      { idx: [0, 1, 5, 4], color: '#3b82f6' }, // -Y
+      { idx: [4, 5, 6, 7], color: '#eab308' }, // +Z
+      { idx: [0, 1, 2, 3], color: '#a855f7' }, // -Z
+    ];
+
+    function drawGrid() {
+      ctx.strokeStyle = '#1b2130'; ctx.lineWidth = 1;
+      const gy = -1.5, N = 6;
+      for (let i = -N; i <= N; i++) {
+        let a = project([i, gy, -N]), b = project([i, gy, N]);
+        ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.stroke();
+        let c = project([-N, gy, i]), d = project([N, gy, i]);
+        ctx.beginPath(); ctx.moveTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.stroke();
+      }
+    }
+
+    function render() {
+      requestAnimationFrame(render);
+      ctx.fillStyle = '#0b0e14'; ctx.fillRect(0, 0, W, H);
+      drawGrid();
+
+      // Collect every face from both cubes, then draw back-to-front.
+      const polys = [];
+      for (const c of controllers) {
+        c.q = qNlerp(c.q, c.targetQuat, 0.35);
+        for (const f of FACES) {
+          const pts = f.idx.map((vi) => {
+            const r = qRot(c.q, VERTS[vi]);
+            return project([r[0] + c.homeX, r[1], r[2]]);
+          });
+          const depth = (pts[0].depth + pts[1].depth + pts[2].depth + pts[3].depth) / 4;
+          polys.push({ pts, color: f.color, edge: c.edgeColor, depth });
+        }
+      }
+      polys.sort((a, b) => b.depth - a.depth);
+      for (const p of polys) {
+        ctx.beginPath();
+        ctx.moveTo(p.pts[0].x, p.pts[0].y);
+        for (let i = 1; i < 4; i++) ctx.lineTo(p.pts[i].x, p.pts[i].y);
+        ctx.closePath();
+        ctx.fillStyle = p.color; ctx.fill();
+        ctx.strokeStyle = p.edge; ctx.lineWidth = 1.5; ctx.stroke();
+      }
+
+      // L / R labels floating above each cube.
+      ctx.font = 'bold 22px system-ui, sans-serif';
+      ctx.textAlign = 'center';
+      for (const c of controllers) {
+        const s = project([c.homeX, 1.7, 0]);
+        ctx.fillStyle = c.edgeColor;
+        ctx.fillText(c.label, s.x, s.y);
+      }
+    }
+
+    // ---------- Controller: owns one BLE device, one cube, one HUD panel ----------
+    function createController({ suffix, homeX, edgeColor, label, deviceLabel }) {
+      const c = {
+        homeX, edgeColor, label,
+        service: UUIDS[suffix].service,
+        characteristic: UUIDS[suffix].characteristic,
+        q:          { w: 1, x: 0, y: 0, z: 0 },
+        targetQuat: { w: 1, x: 0, y: 0, z: 0 },
+        device: null,
+        logged: false,
+        msgCount: 0,
+        lastRateT: performance.now(),
+        btn:      $('connect' + suffix),
+        statusEl: $('status' + suffix),
+        statusTx: $('statusText' + suffix),
+        el: (name) => $(name + suffix),
+      };
+      c.setStatus = (text, on) => {
+        c.statusTx.textContent = text;
+        c.statusEl.classList.toggle('on', !!on);
+      };
+      c.btn.addEventListener('click', () => (c.device ? disconnect(c) : connect(c, deviceLabel)));
+      return c;
+    }
+
+    async function connect(c) {
+      if (!navigator.bluetooth) {
+        c.setStatus('Web Bluetooth not supported', false);
+        return;
+      }
+      try {
+        c.setStatus('Requesting device…', false);
+        c.device = await navigator.bluetooth.requestDevice({
+          filters: [{ services: [c.service] }],
+        });
+        c.device.addEventListener('gattserverdisconnected', () => onDisconnected(c));
+
+        c.setStatus('Connecting…', false);
+        const server = await c.device.gatt.connect();
+        const service = await server.getPrimaryService(c.service);
+        const ch = await service.getCharacteristic(c.characteristic);
+        await ch.startNotifications();
+        ch.addEventListener('characteristicvaluechanged', (e) => onData(c, e));
+        c.logged = false;
+
+        c.setStatus('Connected · streaming', true);
+        c.btn.textContent = 'Disconnect';
+        c.btn.classList.add('disconnect');
+      } catch (e) {
+        c.setStatus('Error: ' + e.message, false);
+        c.device = null;
+      }
+    }
+
+    function disconnect(c) {
+      if (c.device && c.device.gatt.connected) c.device.gatt.disconnect();
+    }
+
+    function onDisconnected(c) {
+      c.device = null;
+      c.btn.textContent = c.btn.id === 'connectL' ? 'Connect Left' : 'Connect Right';
+      c.btn.classList.remove('disconnect');
+      c.setStatus('Disconnected', false);
+    }
+
+    function onData(c, event) {
+      const dv = event.target.value;               // DataView
+      // Packet layout (little-endian):
+      //   16 bytes = quaternion only [w, x, y, z]   (older firmware)
+      //   20 bytes = quaternion + light [w, x, y, z, light 0..1]
+      if (dv.byteLength < 16) return;              // ignore malformed frames
+      const hasLight = dv.byteLength >= 20;
+
+      const w = dv.getFloat32(0,  true);
+      const x = dv.getFloat32(4,  true);
+      const y = dv.getFloat32(8,  true);
+      const z = dv.getFloat32(12, true);
+
+      // One-time diagnostic: confirm what actually arrives (open DevTools console).
+      if (!c.logged) {
+        c.logged = true;
+        console.log(`[${c.btn.id}] first packet: ${dv.byteLength} bytes`,
+          { w, x, y, z, light: hasLight ? dv.getFloat32(16, true) : 'none' });
+      }
+
+      // Firmware quaternion [w,x,y,z] mapped into a Y-up world (swap Y/Z).
+      // Tweak this mapping if the cube's orientation doesn't match the board.
+      c.targetQuat = qNorm({ w: w, x: x, y: z, z: -y });
+
+      const e = eulerYXZ(c.targetQuat);
+      const f = (v) => v.toFixed(1) + '°';
+      c.el('roll').textContent  = f(e.roll);
+      c.el('pitch').textContent = f(e.pitch);
+      c.el('yaw').textContent   = f(e.yaw);
+
+      if (hasLight) {
+        c.el('light').textContent = Math.round(dv.getFloat32(16, true) * 100) + '%';
+      } else {
+        c.el('light').textContent = 'n/a';
+      }
+
+      // Update rate meter once per second.
+      c.msgCount++;
+      const now = performance.now();
+      if (now - c.lastRateT > 1000) {
+        c.el('rate').textContent = Math.round(c.msgCount * 1000 / (now - c.lastRateT)) + ' Hz';
+        c.msgCount = 0; c.lastRateT = now;
+      }
+    }
+
+    // ---------- Instantiate both controllers ----------
+    const controllers = [
+      createController({ suffix: 'L', homeX: -2.0, edgeColor: '#38bdf8', label: 'L', deviceLabel: 'Left'  }),
+      createController({ suffix: 'R', homeX:  2.0, edgeColor: '#fb923c', label: 'R', deviceLabel: 'Right' }),
+    ];
+
+    render();   // starts drawing immediately — cubes are visible before connecting
+  </script>
+</body>
+</html>

@@ -1,0 +1,694 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Gesture Drone Simulator</title>
+  <!--
+    Gesture-Drone SIMULATOR
+    -----------------------
+    Flies a *simulated* quadcopter from the two existing BLE controllers
+    (XIAO-IMU-L / XIAO-IMU-R running controller_poc.ino) — NO bridge, NO real
+    motors. The browser talks to the boards directly over Web Bluetooth, exactly
+    like controller_poc/web/index.html, so the firmware is used unchanged.
+
+    Standard-transmitter (Mode 2) mapping — tilt a controller like a stick,
+    "tilt forward = stick up":
+       LEFT controller  : forward/back tilt -> THROTTLE (climb) ,  side tilt -> YAW
+       RIGHT controller : forward/back tilt -> PITCH (fwd/back) ,  side tilt -> ROLL
+    A ~10 deg dead zone (adjustable) keeps small hand tremors from moving the drone.
+
+    Side-to-side is a true TILT (banking the controller), NOT a horizontal twist:
+    the sticks read the gravity direction in the sensor frame, which does not
+    change when you rotate the controller about the vertical axis. So twisting
+    your wrist flat does nothing; canting it sideways moves the drone.
+
+    The neutral pose is auto-captured the instant a controller connects, so
+    "level" = however you're holding it then, and the fwd/back and side tilt
+    axes are decoupled from that pose. Re-grip? Press "Set center" (or C) to
+    re-zero. Each panel shows live fwd/side tilt + the raw gravity vector so you
+    can watch which gesture moves which axis.
+
+    A single click of a controller's D1 button (streamed as a counter byte by the
+    updated controller_poc.ino) triggers an action:
+       LEFT board click  -> arm / disarm
+       RIGHT board click -> auto liftoff (climb to a hover altitude) / auto land
+    (Double-click still recalibrates, hold-5s still sleeps — unchanged.)
+
+    No hardware? Keyboard fallback drives any stick whose controller isn't
+    connected:  arrows = throttle/yaw (left stick),  W/A/S/D = pitch/roll (right
+    stick),  Enter = arm/disarm,  C = set stick center,  R = reset drone.
+
+    Web Bluetooth needs a secure context: serve over localhost (not file://):
+       cd drone_sim && python -m http.server 8000    -> http://localhost:8000  (Chrome/Edge)
+  -->
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0; overflow: hidden;
+      font-family: system-ui, -apple-system, Segoe UI, Roboto, sans-serif;
+      background: #070a10; color: #e6e6e6;
+    }
+    #view { position: fixed; inset: 0; z-index: 0; display: block; }
+
+    .hud {
+      position: fixed; top: 14px; z-index: 10;
+      background: rgba(16, 20, 30, 0.82);
+      border: 1px solid #263043; border-radius: 12px;
+      padding: 14px 16px; width: 230px; backdrop-filter: blur(6px);
+    }
+    #hud-left  { left: 14px; }
+    #hud-right { right: 14px; }
+    h1 { font-size: 14px; margin: 0 0 10px; letter-spacing: .04em; display: flex; align-items: center; gap: 8px; }
+    h1 .chip { width: 12px; height: 12px; border-radius: 3px; }
+    button {
+      width: 100%; padding: 9px 12px; font-size: 13px; font-weight: 600;
+      color: #06090f; background: #4ade80; border: none; border-radius: 8px; cursor: pointer;
+    }
+    button:disabled { opacity: .5; cursor: default; }
+    button.disconnect { background: #f87171; }
+    .status { margin-top: 9px; font-size: 12px; color: #9aa4b2; }
+    .status .dot { display: inline-block; width: 8px; height: 8px; border-radius: 50%; margin-right: 6px; background: #f87171; vertical-align: middle; }
+    .status.on .dot { background: #4ade80; }
+    .rows { margin-top: 10px; font-variant-numeric: tabular-nums; font-size: 12px; }
+    .rows div { display: flex; justify-content: space-between; padding: 2px 0; color: #c4ccd8; }
+    .rows span:last-child { color: #7dd3fc; }
+    .maps { margin-top: 8px; font-size: 11px; color: #6b7482; line-height: 1.5; }
+
+    /* Bottom transmitter + telemetry bar */
+    #tx {
+      position: fixed; bottom: 14px; left: 50%; transform: translateX(-50%);
+      z-index: 10; display: flex; align-items: center; gap: 18px;
+      background: rgba(16, 20, 30, 0.82); border: 1px solid #263043;
+      border-radius: 14px; padding: 12px 18px; backdrop-filter: blur(6px);
+    }
+    .stick { text-align: center; }
+    .stick canvas { background: #0c1018; border: 1px solid #263043; border-radius: 8px; display: block; }
+    .stick .lbl { font-size: 10px; color: #6b7482; margin-top: 4px; letter-spacing: .08em; }
+    .tele { display: grid; grid-template-columns: auto auto; gap: 2px 16px; font-size: 12px; font-variant-numeric: tabular-nums; }
+    .tele b { color: #7dd3fc; font-weight: 600; }
+    .tele .k { color: #9aa4b2; }
+    #armBtn, #liftBtn { width: 148px; }
+    #armBtn.armed { background: #f87171; }
+    #liftBtn { color: #06090f; font-size: 12px; }
+    #flash { color: #fbbf24; font-size: 12px; min-height: 15px; text-align: center; margin-top: 4px; }
+
+    /* Settings gear panel */
+    #settings {
+      position: fixed; top: 14px; left: 50%; transform: translateX(-50%);
+      z-index: 10; background: rgba(16, 20, 30, 0.82); border: 1px solid #263043;
+      border-radius: 12px; padding: 10px 14px; backdrop-filter: blur(6px);
+      display: flex; gap: 16px; align-items: center; font-size: 12px; flex-wrap: wrap; justify-content: center;
+    }
+    #settings label { color: #9aa4b2; display: flex; align-items: center; gap: 6px; }
+    #settings input[type=range] { width: 90px; vertical-align: middle; }
+    #settings .val { color: #7dd3fc; width: 34px; display: inline-block; text-align: right; font-variant-numeric: tabular-nums; }
+    #settings .inv { display: flex; gap: 8px; align-items: center; }
+    #settings button { width: auto; padding: 6px 10px; background: #2a2f3e; color: #cbd5e1; }
+    .sep { width: 1px; align-self: stretch; background: #263043; }
+    #hint { position: fixed; bottom: 108px; left: 50%; transform: translateX(-50%); z-index: 10; font-size: 11px; color: #55606f; text-align: center; }
+  </style>
+</head>
+<body>
+  <canvas id="view"></canvas>
+
+  <!-- Left controller -> throttle + yaw -->
+  <div class="hud" id="hud-left">
+    <h1><span class="chip" style="background:#38bdf8"></span>Left controller</h1>
+    <button id="connectL">Connect Left</button>
+    <div class="status" id="statusL"><span class="dot"></span><span id="statusTextL">Disconnected</span></div>
+    <div class="rows">
+      <div><span>Fwd/back tilt</span><span id="pitchL">—</span></div>
+      <div><span>Side tilt</span><span id="rollL">—</span></div>
+      <div><span>gravity xyz</span><span id="gL">—</span></div>
+    </div>
+    <div class="maps">tilt fwd/back → <b>throttle</b><br>tilt side to side → <b>yaw</b><br>click button → <b>arm / disarm</b></div>
+  </div>
+
+  <!-- Right controller -> pitch + roll -->
+  <div class="hud" id="hud-right">
+    <h1><span class="chip" style="background:#fb923c"></span>Right controller</h1>
+    <button id="connectR">Connect Right</button>
+    <div class="status" id="statusR"><span class="dot"></span><span id="statusTextR">Disconnected</span></div>
+    <div class="rows">
+      <div><span>Fwd/back tilt</span><span id="pitchR">—</span></div>
+      <div><span>Side tilt</span><span id="rollR">—</span></div>
+      <div><span>gravity xyz</span><span id="gR">—</span></div>
+    </div>
+    <div class="maps">tilt fwd/back → <b>pitch</b><br>tilt side to side → <b>roll</b><br>click button → <b>liftoff / land</b></div>
+  </div>
+
+  <!-- Settings -->
+  <div id="settings">
+    <label>Dead zone <input type="range" id="dz" min="0" max="30" step="1" value="10"><span class="val" id="dzv">10°</span></label>
+    <label>Full tilt <input type="range" id="mx" min="20" max="70" step="1" value="45"><span class="val" id="mxv">45°</span></label>
+    <div class="sep"></div>
+    <div class="inv">
+      <span style="color:#6b7482">invert:</span>
+      <label><input type="checkbox" id="invThr">Thr</label>
+      <label><input type="checkbox" id="invYaw">Yaw</label>
+      <label><input type="checkbox" id="invPit">Pit</label>
+      <label><input type="checkbox" id="invRol">Rol</label>
+    </div>
+    <div class="sep"></div>
+    <button id="centerBtn" title="Hold the controllers at your neutral pose, then click to zero tilt from there (C)">Set center</button>
+    <button id="resetBtn" title="Reset drone position (R)">Reset drone</button>
+  </div>
+
+  <!-- Transmitter sticks + telemetry -->
+  <div id="tx">
+    <div class="stick">
+      <canvas id="stickL" width="96" height="96"></canvas>
+      <div class="lbl">THR / YAW</div>
+    </div>
+    <div>
+      <button id="armBtn">ARM</button>
+      <button id="liftBtn" style="margin-top:6px;background:#38bdf8">LIFTOFF / LAND</button>
+      <div id="flash"></div>
+    </div>
+    <div class="tele">
+      <span class="k">Altitude</span><b id="tAlt">0.0 m</b>
+      <span class="k">Ground spd</span><b id="tSpd">0.0 m/s</b>
+      <span class="k">Heading</span><b id="tHdg">0°</b>
+      <span class="k">Throttle</span><b id="tThr">0%</b>
+    </div>
+    <div class="stick">
+      <canvas id="stickR" width="96" height="96"></canvas>
+      <div class="lbl">PITCH / ROLL</div>
+    </div>
+  </div>
+
+  <div id="hint">
+    Board buttons: click LEFT = arm/disarm · click RIGHT = liftoff/land &nbsp;|&nbsp;
+    No boards? Arrows = throttle/yaw · W A S D = pitch/roll · Enter = arm · L = liftoff/land · C = center · R = reset
+  </div>
+
+  <script>
+    const $ = (id) => document.getElementById(id);
+
+    // ---- Must match controller_poc.ino (unchanged firmware) ----
+    const UUIDS = {
+      L: { service: '12345678-1234-5678-1234-56789abcde10', characteristic: '12345678-1234-5678-1234-56789abcde11' },
+      R: { service: '12345678-1234-5678-1234-56789abcde20', characteristic: '12345678-1234-5678-1234-56789abcde21' },
+    };
+
+    // ===================== gravity-referenced tilt =====================
+    // We drive the sticks from TILT, not rotation. The gravity direction as seen
+    // in the sensor frame (Madgwick's estimate) is invariant to twisting the
+    // controller about the vertical axis — spin it flat and gravity doesn't move
+    // relative to the board — so tilt derived from it ignores horizontal twist.
+    //
+    // gravityDir(q): earth's "up" expressed in the sensor frame, from the raw
+    // firmware quaternion [w,x,y,z]. Level (board flat) -> ~(0,0,1).
+    function gravityDir(w, x, y, z) {
+      const n = Math.hypot(w, x, y, z) || 1; w/=n; x/=n; y/=n; z/=n;
+      return norm({ x: 2*(x*z - w*y), y: 2*(w*x + y*z), z: w*w - x*x - y*y + z*z });
+    }
+    // Build the neutral reference: the gravity dir at "center" plus two tangent
+    // axes (right / forward) fixed to the board. Tilt is then measured as how far
+    // gravity has leaned along each axis from neutral — pure tilt, no twist, and
+    // it works from ANY held pose, not just flat.
+    function tiltReference(g) {
+      const proj = (a) => { const d = dot(a, g); return { x: a.x - d*g.x, y: a.y - d*g.y, z: a.z - d*g.z }; };
+      let right = proj({ x: 1, y: 0, z: 0 });                 // sensor +X into the tangent plane
+      if (Math.hypot(right.x, right.y, right.z) < 0.3) right = proj({ x: 0, y: 0, z: 1 }); // X∥g -> fall back to +Z
+      right = norm(right);
+      const fwd = norm(cross(g, right));
+      return { gRef: g, axRight: right, axFwd: fwd };
+    }
+    const FLAT_REF = tiltReference({ x: 0, y: 0, z: 1 });      // default before any Set center
+    // Returns { fwd, side } tilt in degrees relative to the controller's neutral.
+    function computeTilt(c) {
+      const up = dot(c.g, c.gRef), s = dot(c.g, c.axRight), f = dot(c.g, c.axFwd);
+      const D = 180 / Math.PI;
+      return { fwd: Math.atan2(f, up) * D, side: Math.atan2(s, up) * D };
+    }
+
+    // ===================== controllers (BLE) =====================
+    // Each holds the latest gravity direction, the neutral tilt reference (from
+    // Set center / C), and the last computed fwd/side tilt fed to the sticks.
+    function makeController(suffix, edge) {
+      return {
+        suffix, edge,
+        service: UUIDS[suffix].service, characteristic: UUIDS[suffix].characteristic,
+        device: null, connected: false,
+        g: { x: 0, y: 0, z: 1 },      // latest gravity direction in the sensor frame
+        gRef: FLAT_REF.gRef, axRight: FLAT_REF.axRight, axFwd: FLAT_REF.axFwd,  // neutral reference
+        tFwd: 0, tSide: 0,            // latest tilt (deg) relative to neutral
+        centerPending: false,         // capture neutral pose on the next packet (set on connect)
+        lastClickSeq: null,           // last button-click counter seen (null = not synced yet)
+        btn: $('connect' + suffix), statusEl: $('status' + suffix), statusTx: $('statusText' + suffix),
+      };
+    }
+    const L = makeController('L', '#38bdf8');
+    const R = makeController('R', '#fb923c');
+    const controllers = [L, R];
+
+    function setStatus(c, text, on) { c.statusTx.textContent = text; c.statusEl.classList.toggle('on', !!on); }
+
+    async function connect(c) {
+      if (!navigator.bluetooth) { setStatus(c, 'Web Bluetooth not supported', false); return; }
+      try {
+        setStatus(c, 'Requesting device…', false);
+        c.device = await navigator.bluetooth.requestDevice({ filters: [{ services: [c.service] }] });
+        c.device.addEventListener('gattserverdisconnected', () => onDisconnected(c));
+        setStatus(c, 'Connecting…', false);
+        const server = await c.device.gatt.connect();
+        const service = await server.getPrimaryService(c.service);
+        const ch = await service.getCharacteristic(c.characteristic);
+        await ch.startNotifications();
+        ch.addEventListener('characteristicvaluechanged', (e) => onData(c, e));
+        c.connected = true;
+        c.centerPending = true;       // capture whatever pose it's held in now as neutral
+        setStatus(c, 'Connected · streaming', true);
+        c.btn.textContent = 'Disconnect'; c.btn.classList.add('disconnect');
+      } catch (e) { setStatus(c, 'Error: ' + e.message, false); c.device = null; }
+    }
+    function disconnect(c) { if (c.device && c.device.gatt.connected) c.device.gatt.disconnect(); }
+    function onDisconnected(c) {
+      c.device = null; c.connected = false; c.lastClickSeq = null;
+      c.btn.textContent = c.suffix === 'L' ? 'Connect Left' : 'Connect Right';
+      c.btn.classList.remove('disconnect');
+      setStatus(c, 'Disconnected', false);
+    }
+    function onData(c, event) {
+      const dv = event.target.value;
+      if (dv.byteLength < 16) return;
+      const w = dv.getFloat32(0, true), x = dv.getFloat32(4, true), y = dv.getFloat32(8, true), z = dv.getFloat32(12, true);
+      c.g = gravityDir(w, x, y, z);   // gravity dir -> yaw/twist-independent tilt
+      if (c.centerPending) { applyCenter(c); c.centerPending = false; flash(c.suffix + ' centered'); }
+
+      // Byte 20 (if present) is the firmware's single-click counter. A change
+      // = one confirmed button click. Sync silently on the first packet so a
+      // reconnect doesn't fire a phantom click.
+      if (dv.byteLength >= 21) {
+        const seq = dv.getUint8(20);
+        if (c.lastClickSeq === null) c.lastClickSeq = seq;
+        else if (seq !== c.lastClickSeq) { c.lastClickSeq = seq; onControllerClick(c); }
+      }
+    }
+    // LEFT board click = arm/disarm ; RIGHT board click = auto liftoff/land.
+    function onControllerClick(c) { if (c.suffix === 'L') toggleArm(); else autoLiftoffLand(); }
+    L.btn.addEventListener('click', () => (L.device ? disconnect(L) : connect(L)));
+    R.btn.addEventListener('click', () => (R.device ? disconnect(R) : connect(R)));
+
+    // ===================== settings =====================
+    const cfg = { deadzone: 10, maxTilt: 45, invThr: false, invYaw: false, invPit: false, invRol: false };
+    $('dz').addEventListener('input', (e) => { cfg.deadzone = +e.target.value; $('dzv').textContent = cfg.deadzone + '°'; });
+    $('mx').addEventListener('input', (e) => { cfg.maxTilt = +e.target.value; $('mxv').textContent = cfg.maxTilt + '°'; });
+    $('invThr').addEventListener('change', (e) => cfg.invThr = e.target.checked);
+    $('invYaw').addEventListener('change', (e) => cfg.invYaw = e.target.checked);
+    $('invPit').addEventListener('change', (e) => cfg.invPit = e.target.checked);
+    $('invRol').addEventListener('change', (e) => cfg.invRol = e.target.checked);
+
+    // tilt angle (deg) -> stick axis in -1..1, with dead zone and full-scale clamp.
+    function axis(angle, invert) {
+      const s = Math.sign(angle), a = Math.abs(angle);
+      if (a <= cfg.deadzone) return 0;
+      const span = Math.max(1, cfg.maxTilt - cfg.deadzone);
+      const t = Math.min(1, (a - cfg.deadzone) / span);
+      return (invert ? -1 : 1) * s * t;
+    }
+
+    // ===================== keyboard fallback =====================
+    // Drives any stick whose controller isn't connected. Held key = full deflection.
+    const keys = {};
+    addEventListener('keydown', (e) => {
+      const k = e.key.toLowerCase();
+      if (k === 'enter') { toggleArm(); e.preventDefault(); return; }
+      if (k === 'l') { autoLiftoffLand(); return; }
+      if (k === 'c') { setCenter(); return; }
+      if (k === 'r') { resetDrone(); return; }
+      keys[e.key] = true;
+      if (['ArrowUp','ArrowDown','ArrowLeft','ArrowRight',' '].includes(e.key)) e.preventDefault();
+    });
+    addEventListener('keyup', (e) => { keys[e.key] = false; });
+    function kAxis(pos, neg) { return (keys[pos] ? 1 : 0) - (keys[neg] ? 1 : 0); }
+
+    // ===================== stick values (fed to the sim each frame) =====================
+    // sticks: -1..1.  throttle: -1 (descend) .. +1 (climb), 0 = hold altitude (hover).
+    const stick = { thr: 0, yaw: 0, pitch: 0, roll: 0 };
+    function updateSticks() {
+      // LEFT controller -> throttle (fwd/back tilt) + yaw (side tilt)
+      if (L.connected) {
+        const t = computeTilt(L); L.tFwd = t.fwd; L.tSide = t.side;
+        stick.thr = axis(t.fwd,  cfg.invThr);
+        stick.yaw = axis(t.side, cfg.invYaw);
+      } else {
+        stick.thr = kAxis('ArrowUp', 'ArrowDown');
+        stick.yaw = kAxis('ArrowRight', 'ArrowLeft');
+      }
+      // RIGHT controller -> pitch (fwd/back tilt) + roll (side tilt)
+      if (R.connected) {
+        const t = computeTilt(R); R.tFwd = t.fwd; R.tSide = t.side;
+        stick.pitch = axis(t.fwd,  cfg.invPit);
+        stick.roll  = axis(t.side, cfg.invRol);
+      } else {
+        stick.pitch = kAxis('w', 's');
+        stick.roll  = kAxis('d', 'a');
+      }
+    }
+    // Capture one controller's current pose as its neutral (zero tilt) reference.
+    function applyCenter(c) {
+      const ref = tiltReference(c.g);
+      c.gRef = ref.gRef; c.axRight = ref.axRight; c.axFwd = ref.axFwd;
+    }
+    // Hold the controllers exactly how you want "sticks centered" to feel, then
+    // Set center — fwd/back and side tilt are both measured from that pose, which
+    // also decouples the two axes so twisting can't leak into the other one.
+    function setCenter() {
+      let n = 0;
+      for (const c of controllers) if (c.connected) { applyCenter(c); n++; }
+      flash(n ? 'Center set — tilt zeroed here' : 'Connect a controller first');
+    }
+    $('centerBtn').addEventListener('click', setCenter);
+
+    // ===================== drone physics (simple, stable) =====================
+    const drone = { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, armed: false,
+                    auto: null, rotor: 0, bank: 0, tilt: 0 };   // auto: null | 'liftoff' | 'land'
+    const P = { MAX_CLIMB: 4, MAX_SPEED: 8, YAW_RATE: 100 * Math.PI/180, VIS_TILT: 24 * Math.PI/180 };
+    const AUTO_ALT = 3;   // metres the auto-liftoff climbs to and holds
+    const clamp = (v, lo, hi) => Math.max(lo, Math.min(hi, v));
+
+    function resetDrone() {
+      Object.assign(drone, { x: 0, y: 0, z: 0, vx: 0, vy: 0, vz: 0, yaw: 0, auto: null, bank: 0, tilt: 0 });
+      flash('Drone reset');
+    }
+    $('resetBtn').addEventListener('click', resetDrone);
+
+    function setArmed(on) {
+      drone.armed = on;
+      if (!on) drone.auto = null;                 // disarm cancels any auto sequence
+      const b = $('armBtn');
+      b.textContent = on ? 'DISARM' : 'ARM';
+      b.classList.toggle('armed', on);
+    }
+    function toggleArm() { setArmed(!drone.armed); flash(drone.armed ? 'ARMED — fly it' : 'Disarmed'); }
+    $('armBtn').addEventListener('click', toggleArm);
+
+    // Right-board click / L key: airborne -> auto land; otherwise arm + auto climb.
+    function autoLiftoffLand() {
+      if (drone.armed && drone.y > 0.15 && drone.auto !== 'land') {
+        drone.auto = 'land'; flash('Auto land');
+      } else {
+        setArmed(true); drone.auto = 'liftoff'; flash('Auto liftoff → ' + AUTO_ALT + ' m');
+      }
+    }
+    $('liftBtn').addEventListener('click', autoLiftoffLand);
+
+    let flashTimer = 0;
+    function flash(msg) { $('flash').textContent = msg; flashTimer = 1.6; }
+
+    function physics(dt) {
+      const approach = (cur, tgt, rate) => cur + (tgt - cur) * Math.min(1, dt * rate);
+
+      if (!drone.armed) {
+        // Settle onto the ground when disarmed.
+        drone.vx = approach(drone.vx, 0, 3); drone.vz = approach(drone.vz, 0, 3);
+        drone.vy = approach(drone.vy, drone.y > 0 ? -3 : 0, 4);
+        drone.bank = approach(drone.bank, 0, 6); drone.tilt = approach(drone.tilt, 0, 6);
+      } else {
+        drone.yaw += stick.yaw * P.YAW_RATE * dt;
+
+        // Nose (-Z local) and right (+X local) directions in world, from yaw.
+        const cy = Math.cos(drone.yaw), sy = Math.sin(drone.yaw);
+        const fwd = { x: -sy, z: -cy };     // rotY applied to (0,0,-1)
+        const rgt = { x:  cy, z: -sy };     // rotY applied to (1,0,0)
+
+        const tgtFwd = stick.pitch * P.MAX_SPEED;
+        const tgtRgt = stick.roll  * P.MAX_SPEED;
+        const tgtVx = fwd.x * tgtFwd + rgt.x * tgtRgt;
+        const tgtVz = fwd.z * tgtFwd + rgt.z * tgtRgt;
+        drone.vx = approach(drone.vx, tgtVx, 3);
+        drone.vz = approach(drone.vz, tgtVz, 3);
+
+        // Throttle: auto liftoff/land override the manual stick until it settles
+        // (or the pilot grabs the throttle, which cancels the auto sequence).
+        let thrCmd = stick.thr;
+        if (drone.auto) {
+          if (Math.abs(stick.thr) > 0.15) { drone.auto = null; }
+          else if (drone.auto === 'liftoff') {
+            const err = AUTO_ALT - drone.y;
+            thrCmd = clamp(err * 0.9 - drone.vy * 0.4, -1, 1);
+            if (Math.abs(err) < 0.15 && Math.abs(drone.vy) < 0.2) { drone.auto = null; flash('Holding ' + AUTO_ALT + ' m'); }
+          } else if (drone.auto === 'land') {
+            thrCmd = clamp(-0.5 - drone.vy * 0.2, -1, 0.2);
+            if (drone.y <= 0.03) { setArmed(false); flash('Landed'); }
+          }
+        }
+        drone.vy = approach(drone.vy, thrCmd * P.MAX_CLIMB, 4);
+
+        drone.bank = approach(drone.bank,  stick.roll  * P.VIS_TILT, 6);
+        drone.tilt = approach(drone.tilt, -stick.pitch * P.VIS_TILT, 6); // nose down when moving fwd
+      }
+
+      drone.x += drone.vx * dt; drone.y += drone.vy * dt; drone.z += drone.vz * dt;
+      if (drone.y < 0) { drone.y = 0; if (drone.vy < 0) drone.vy = 0; }
+
+      drone.rotor += (drone.armed ? 26 : 0) * dt;   // rotor spin, rad/s
+    }
+
+    // ===================== 3D renderer (look-at camera, painter's algorithm) =====================
+    const canvas = $('view'), ctx = canvas.getContext('2d');
+    const dpr = Math.min(devicePixelRatio || 1, 2);
+    let W = 0, H = 0, cx = 0, cy = 0;
+    function resize() {
+      W = innerWidth; H = innerHeight; cx = W/2; cy = H/2;
+      canvas.width = W*dpr; canvas.height = H*dpr;
+      canvas.style.width = W+'px'; canvas.style.height = H+'px';
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+    }
+    addEventListener('resize', resize); resize();
+
+    // camera state (chase cam)
+    const cam = { x: 0, y: 4, z: 8, tx: 0, ty: 0, tz: 0 };
+    const FOCAL = () => Math.min(W, H) * 0.9;
+    let view = null; // {eye, r, u, f}  basis for world->view
+
+    function sub(a, b) { return { x: a.x-b.x, y: a.y-b.y, z: a.z-b.z }; }
+    function norm(v) { const n = Math.hypot(v.x, v.y, v.z) || 1; return { x: v.x/n, y: v.y/n, z: v.z/n }; }
+    function cross(a, b) { return { x: a.y*b.z - a.z*b.y, y: a.z*b.x - a.x*b.z, z: a.x*b.y - a.y*b.x }; }
+    function dot(a, b) { return a.x*b.x + a.y*b.y + a.z*b.z; }
+
+    function buildView() {
+      const eye = { x: cam.x, y: cam.y, z: cam.z };
+      const f = norm(sub({ x: cam.tx, y: cam.ty, z: cam.tz }, eye)); // look dir
+      const r = norm(cross(f, { x: 0, y: 1, z: 0 }));
+      const u = cross(r, f);
+      view = { eye, r, u, f };
+    }
+    // world point -> screen {x, y, depth}; depth <= 0 means behind camera.
+    function project(p) {
+      const rel = sub(p, view.eye);
+      const vz = dot(rel, view.f);              // depth along look dir
+      if (vz <= 0.05) return { x: 0, y: 0, depth: -1 };
+      const vx = dot(rel, view.r), vy = dot(rel, view.u);
+      const s = FOCAL() / vz;
+      return { x: cx + vx*s, y: cy - vy*s, depth: vz };
+    }
+
+    // rotate a local drone point by roll(Z) -> pitch(X) -> yaw(Y), then translate to world.
+    function modelPoint(lp) {
+      let x = lp[0], y = lp[1], z = lp[2];
+      const cr = Math.cos(drone.bank), sr = Math.sin(drone.bank);
+      let x1 = x*cr - y*sr, y1 = x*sr + y*cr, z1 = z;
+      const cp = Math.cos(drone.tilt), sp = Math.sin(drone.tilt);
+      let y2 = y1*cp - z1*sp, z2 = y1*sp + z1*cp, x2 = x1;
+      const cyw = Math.cos(drone.yaw), syw = Math.sin(drone.yaw);
+      let x3 = x2*cyw + z2*syw, z3 = -x2*syw + z2*cyw, y3 = y2;
+      return { x: x3 + drone.x, y: y3 + drone.y + 0.0, z: z3 + drone.z };
+    }
+
+    // ---- drone geometry (nose toward -Z) ----
+    const B = 0.20, BH = 0.09, ARM = 0.52, RR = 0.30; // body half, body h, arm len, rotor radius
+    const BODY = [
+      [-B,-BH,-B],[B,-BH,-B],[B,BH,-B],[-B,BH,-B],
+      [-B,-BH, B],[B,-BH, B],[B,BH, B],[-B,BH, B],
+    ];
+    const BODY_FACES = [
+      { idx:[1,5,6,2], color:'#3a4356' }, { idx:[0,4,7,3], color:'#3a4356' },
+      { idx:[3,2,6,7], color:'#4b5670' }, { idx:[0,1,5,4], color:'#2b3243' },
+      { idx:[4,5,6,7], color:'#2b3243' }, { idx:[0,1,2,3], color:'#2b3243' },
+    ];
+    const MOTORS = [
+      { p:[-ARM,0,-ARM], c:'#f87171' }, // front-left  (fronts red)
+      { p:[ ARM,0,-ARM], c:'#f87171' }, // front-right
+      { p:[-ARM,0, ARM], c:'#94a3b8' }, // rear-left
+      { p:[ ARM,0, ARM], c:'#94a3b8' }, // rear-right
+    ];
+    const ROTOR_PTS = 16;
+
+    function addPoly(list, worldPts, fill, stroke) {
+      const pts = worldPts.map(project);
+      if (pts.some(p => p.depth < 0)) return;
+      const depth = pts.reduce((s, p) => s + p.depth, 0) / pts.length;
+      list.push({ kind: 'poly', pts, fill, stroke, depth });
+    }
+    function addLine(list, a, b, stroke, wLine) {
+      const pa = project(a), pb = project(b);
+      if (pa.depth < 0 || pb.depth < 0) return;
+      list.push({ kind: 'line', a: pa, b: pb, stroke, w: wLine || 2, depth: (pa.depth + pb.depth) / 2 });
+    }
+
+    function drawGround() {
+      // Grid centered near the drone so it always has texture beneath it.
+      ctx.lineWidth = 1;
+      const step = 2, N = 26;
+      const gx = Math.round(drone.x / step) * step, gz = Math.round(drone.z / step) * step;
+      for (let i = -N; i <= N; i++) {
+        const a = project({ x: gx + i*step, y: 0, z: gz - N*step });
+        const b = project({ x: gx + i*step, y: 0, z: gz + N*step });
+        if (a.depth > 0 && b.depth > 0) { ctx.strokeStyle = '#141b28'; ctx.beginPath(); ctx.moveTo(a.x,a.y); ctx.lineTo(b.x,b.y); ctx.stroke(); }
+        const c = project({ x: gx - N*step, y: 0, z: gz + i*step });
+        const d = project({ x: gx + N*step, y: 0, z: gz + i*step });
+        if (c.depth > 0 && d.depth > 0) { ctx.strokeStyle = '#141b28'; ctx.beginPath(); ctx.moveTo(c.x,c.y); ctx.lineTo(d.x,d.y); ctx.stroke(); }
+      }
+    }
+
+    // Fixed pylons give a sense of motion & altitude.
+    const PYLONS = [];
+    for (let i = 0; i < 24; i++) {
+      const ang = i * 2.399963; const rad = 6 + (i % 6) * 4;
+      PYLONS.push({ x: Math.cos(ang)*rad, z: Math.sin(ang)*rad, h: 1.2 + (i % 4)*0.7, c: ['#1e3a5f','#3f2d5c','#14532d','#5c3d1e'][i%4] });
+    }
+    function drawPylons(list) {
+      for (const p of PYLONS) {
+        addLine(list, { x: p.x, y: 0, z: p.z }, { x: p.x, y: p.h, z: p.z }, p.c, 6);
+        const top = project({ x: p.x, y: p.h, z: p.z });
+        if (top.depth > 0) list.push({ kind: 'dot', x: top.x, y: top.y, r: 3, c: p.c, depth: top.depth });
+      }
+    }
+
+    function drawShadow(list) {
+      // Flatten a ring onto the ground under the drone.
+      const pts = [];
+      for (let i = 0; i < 12; i++) {
+        const a = i / 12 * Math.PI * 2;
+        pts.push({ x: drone.x + Math.cos(a)*ARM*1.1, y: 0.01, z: drone.z + Math.sin(a)*ARM*1.1 });
+      }
+      const sp = pts.map(project);
+      if (sp.some(p => p.depth < 0)) return;
+      const alpha = Math.max(0.05, 0.35 - drone.y * 0.05);
+      list.push({ kind: 'poly', pts: sp, fill: `rgba(0,0,0,${alpha})`, stroke: null, depth: sp.reduce((s,p)=>s+p.depth,0)/sp.length + 100 });
+    }
+
+    function drawDrone(list) {
+      // body
+      for (const f of BODY_FACES) addPoly(list, f.idx.map(i => modelPoint(BODY[i])), f.fill, '#0b0e14');
+      // arms + rotors
+      for (const m of MOTORS) {
+        addLine(list, modelPoint([0,0,0]), modelPoint(m.p), '#4b5670', 5);
+        // rotor disk
+        const ring = [];
+        for (let i = 0; i < ROTOR_PTS; i++) {
+          const a = i / ROTOR_PTS * Math.PI * 2;
+          ring.push(modelPoint([ m.p[0] + Math.cos(a)*RR, BH + 0.02, m.p[2] + Math.sin(a)*RR ]));
+        }
+        addPoly(list, ring, 'rgba(125,211,252,0.10)', 'rgba(125,211,252,0.5)');
+        // spinning 2-blade indicator
+        for (let b = 0; b < 2; b++) {
+          const a = drone.rotor + b * Math.PI;
+          const p1 = modelPoint([ m.p[0] + Math.cos(a)*RR, BH + 0.03, m.p[2] + Math.sin(a)*RR ]);
+          const p2 = modelPoint([ m.p[0] - Math.cos(a)*RR, BH + 0.03, m.p[2] - Math.sin(a)*RR ]);
+          addLine(list, p1, p2, m.c, 3);
+        }
+      }
+      // nose marker (bright, points -Z)
+      const n1 = modelPoint([ 0, BH, -B ]); const n2 = modelPoint([ -0.09, BH, -B-0.16 ]); const n3 = modelPoint([ 0.09, BH, -B-0.16 ]);
+      addPoly(list, [n1, n2, n3], '#fbbf24', '#fbbf24');
+    }
+
+    function render() {
+      // chase camera: sit behind the nose, a bit above, look slightly ahead.
+      const cyw = Math.cos(drone.yaw), syw = Math.sin(drone.yaw);
+      const fwd = { x: -syw, z: -cyw };
+      const desired = { x: drone.x - fwd.x*7, y: drone.y + 3.2, z: drone.z - fwd.z*7 };
+      cam.x += (desired.x - cam.x) * 0.08;
+      cam.y += (desired.y - cam.y) * 0.08;
+      cam.z += (desired.z - cam.z) * 0.08;
+      cam.tx = drone.x + fwd.x*2; cam.ty = drone.y + 0.4; cam.tz = drone.z + fwd.z*2;
+      buildView();
+
+      // sky gradient
+      const g = ctx.createLinearGradient(0, 0, 0, H);
+      g.addColorStop(0, '#0d1522'); g.addColorStop(1, '#070a10');
+      ctx.fillStyle = g; ctx.fillRect(0, 0, W, H);
+
+      drawGround();
+
+      const list = [];
+      drawPylons(list);
+      drawShadow(list);
+      drawDrone(list);
+      list.sort((a, b) => b.depth - a.depth);
+      for (const o of list) {
+        if (o.kind === 'poly') {
+          ctx.beginPath(); ctx.moveTo(o.pts[0].x, o.pts[0].y);
+          for (let i = 1; i < o.pts.length; i++) ctx.lineTo(o.pts[i].x, o.pts[i].y);
+          ctx.closePath();
+          if (o.fill) { ctx.fillStyle = o.fill; ctx.fill(); }
+          if (o.stroke) { ctx.strokeStyle = o.stroke; ctx.lineWidth = 1.2; ctx.stroke(); }
+        } else if (o.kind === 'line') {
+          ctx.strokeStyle = o.stroke; ctx.lineWidth = o.w;
+          ctx.beginPath(); ctx.moveTo(o.a.x, o.a.y); ctx.lineTo(o.b.x, o.b.y); ctx.stroke();
+        } else if (o.kind === 'dot') {
+          ctx.fillStyle = o.c; ctx.beginPath(); ctx.arc(o.x, o.y, o.r, 0, Math.PI*2); ctx.fill();
+        }
+      }
+    }
+
+    // ===================== stick + HUD widgets =====================
+    function drawStick(cvId, xv, yv, colX, colY) {
+      const c = $(cvId), g = c.getContext('2d'), s = c.width, m = 10, r = (s - 2*m)/2, cX = s/2, cY = s/2;
+      g.clearRect(0, 0, s, s);
+      g.fillStyle = '#0c1018'; g.fillRect(0, 0, s, s);
+      // dead-zone ring
+      g.strokeStyle = '#1f2937'; g.lineWidth = 1;
+      g.beginPath(); g.arc(cX, cY, r * (cfg.deadzone / cfg.maxTilt), 0, Math.PI*2); g.stroke();
+      // crosshair
+      g.strokeStyle = '#263043';
+      g.beginPath(); g.moveTo(m, cY); g.lineTo(s-m, cY); g.moveTo(cX, m); g.lineTo(cX, s-m); g.stroke();
+      // dot (yv up = negative screen y)
+      const px = cX + xv * r, py = cY - yv * r;
+      g.fillStyle = '#e6e6e6'; g.beginPath(); g.arc(px, py, 6, 0, Math.PI*2); g.fill();
+      g.strokeStyle = '#7dd3fc'; g.lineWidth = 2; g.stroke();
+    }
+
+    function updateHUD() {
+      const f1 = (v) => (v >= 0 ? '+' : '') + v.toFixed(0) + '°';
+      $('pitchL').textContent = L.connected ? f1(L.tFwd)  : (kAxis('ArrowUp','ArrowDown') ? 'key' : '—');
+      $('rollL').textContent  = L.connected ? f1(L.tSide) : (kAxis('ArrowRight','ArrowLeft') ? 'key' : '—');
+      $('pitchR').textContent = R.connected ? f1(R.tFwd)  : (kAxis('w','s') ? 'key' : '—');
+      $('rollR').textContent  = R.connected ? f1(R.tSide) : (kAxis('d','a') ? 'key' : '—');
+      const gtxt = (c) => c.g.x.toFixed(2) + ' ' + c.g.y.toFixed(2) + ' ' + c.g.z.toFixed(2);
+      $('gL').textContent = L.connected ? gtxt(L) : '—';
+      $('gR').textContent = R.connected ? gtxt(R) : '—';
+
+      drawStick('stickL', stick.yaw, stick.thr);
+      drawStick('stickR', stick.roll, stick.pitch);
+
+      const spd = Math.hypot(drone.vx, drone.vz);
+      $('tAlt').textContent = drone.y.toFixed(1) + ' m';
+      $('tSpd').textContent = spd.toFixed(1) + ' m/s';
+      let hdg = (-drone.yaw * 180/Math.PI) % 360; if (hdg < 0) hdg += 360;
+      $('tHdg').textContent = Math.round(hdg) + '°';
+      $('tThr').textContent = Math.round(stick.thr * 100) + '%';
+    }
+
+    // ===================== main loop =====================
+    let last = performance.now();
+    function frame(now) {
+      let dt = (now - last) / 1000; last = now;
+      if (dt > 0.05) dt = 0.05;                 // clamp after tab-switch
+      updateSticks();
+      physics(dt);
+      render();
+      updateHUD();
+      if (flashTimer > 0) { flashTimer -= dt; if (flashTimer <= 0) $('flash').textContent = ''; }
+      requestAnimationFrame(frame);
+    }
+    requestAnimationFrame(frame);
+  </script>
+</body>
+</html>
